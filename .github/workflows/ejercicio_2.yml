@@ -94,6 +94,7 @@ jobs:
     name: Tomar el pirmer elemento HTML, transformarlo en PDF y exportarlo
     runs-on: ubuntu-latest
     needs: consumir-api
+    timeout-minutes: 5
     strategy:
       fail-fast: false
       matrix:
