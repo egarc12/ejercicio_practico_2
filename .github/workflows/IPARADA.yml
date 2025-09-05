@@ -1,0 +1,121 @@
+name: Eventos historicos wikipedia
+
+on:
+  workflow_dispatch:
+    inputs:
+      dia:
+        description: Ingrese día (DD)
+        required: true
+        type: choice
+        options: [ "01","02","03","04","05","06","07","08","09","10",
+                   "11","12","13","14","15","16","17","18","19","20",
+                   "21","22","23","24","25","26","27","28","29","30","31" ]
+      mes:
+        description: Ingrese mes (MM)
+        required: true
+        type: choice
+        options: [ "01","02","03","04","05","06","07","08","09","10","11","12" ]
+
+jobs:
+  consultar-wikimedia:
+    runs-on: ubuntu-latest
+    outputs:
+      events-json: ${{ steps.get-json.outputs.events }}
+    steps:
+      - name: Preparar variables
+        id: vars
+        run: |
+          MES="${{ github.event.inputs.mes }}"
+          DIA="${{ github.event.inputs.dia }}"
+          LANG="${{ vars.LANG }}"
+          echo "MES=$MES" >> $GITHUB_ENV
+          echo "DIA=$DIA" >> $GITHUB_ENV
+          echo "LANG=$LANG" >> $GITHUB_ENV
+          echo "DATE_LANG=${LANG}-${MES}-${DIA}" >> $GITHUB_ENV
+
+      - name: Crear hash
+        id: json_hash
+        run: |
+          echo "hash=$(echo -n '${{ env.DATE_LANG }}' | sha256sum | cut -d ' ' -f1)" >> $GITHUB_OUTPUT
+
+      - name: Restaurar cache de la API
+        id: cache-json
+        uses: actions/cache@v4
+        env:
+          cache-name: cache json
+        with:
+          path: wiki.json
+          key: ${{ runner.os }}-${{ env.cache-name }}-${{ steps.json_hash.outputs.hash }}
+
+      - name: Llamar API de Wikimedia si no hay cache
+        if: ${{ steps.cache-json.outputs.cache-hit != 'true' }}
+        run: |
+          echo "Consultando API wikimedia..."
+          STATUS=$(curl -sL -w "%{http_code}" -o wiki.json.tmp \
+            "https://api.wikimedia.org/feed/v1/wikipedia/${LANG}/onthisday/all/${MES}/${DIA}" \
+            --header "User-Agent: GitHubActions-Efemerides/1.0")
+
+          if [ "$STATUS" -eq 200 ]; then
+            mv wiki.json.tmp wiki.json
+          else
+            echo "Error en API (HTTP $STATUS). No se encontraron eventos."
+            echo "[]" > wiki.json
+          fi
+
+      - name: Extraer eventos para matrix
+        id: get-json
+        run: |
+          if [ -s wiki.json ]; then
+            COUNT=$(jq '.selected | length' wiki.json)
+            if [ "$COUNT" -eq 0 ]; then
+              echo "No se encontraron eventos para la fecha ${DIA}/${MES}."
+              echo "events=[]" >> $GITHUB_OUTPUT
+            else
+              jq -c '[.selected[] | {title: .pages[0].title, url: .pages[0].content_urls.desktop.page}]' wiki.json > events.json
+              EVENTS=$(cat events.json)
+              echo "Se encontraron $COUNT eventos."
+              echo "events=$EVENTS" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "wiki.json vacío. No se pudieron extraer eventos."
+            echo "events=[]" >> $GITHUB_OUTPUT
+          fi
+
+  generar-pdfs:
+    needs: consultar-wikimedia
+    runs-on: ubuntu-latest
+    if: ${{ needs.consultar-wikimedia.outputs.events-json != '[]' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        page: ${{ fromJson(needs.consultar-wikimedia.outputs.events-json) }}
+    steps:
+      - name: Guardar nombre de PDF
+        run: |
+          SAFE_TITLE=$(echo "${{ matrix.page.title }}" | tr ' ' '_' | tr -cd '[:alnum:]_')
+          PDF_NAME="${{ github.event.inputs.mes }}-${{ github.event.inputs.dia }}-${SAFE_TITLE}.pdf"
+          echo "PDF_NAME=$PDF_NAME" >> $GITHUB_ENV
+
+      - name: Cache PDF generado
+        id: cache-pdf
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.PDF_NAME }}
+          key: pdf-${{ env.PDF_NAME }}
+
+      - name: Descargar página HTML
+        run: curl -L "${{ matrix.page.url }}" -o page.html
+
+      - name: Generar PDF desde HTML
+        if: ${{ steps.cache-pdf.outputs.cache-hit != 'true' }}
+        uses: fifsky/html-to-pdf-action@master
+        with:
+          htmlFile: page.html
+          outputFile: ${{ env.PDF_NAME }}
+
+      - name: Subir PDF como artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PDF_NAME }}
+          path: ${{ env.PDF_NAME }}
+          retention-days: 1
